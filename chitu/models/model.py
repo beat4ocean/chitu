@@ -16,7 +16,7 @@ from chitu.attn_backend import AttnBackend
 from chitu.cache_manager import PagedKVCacheManager
 from chitu.global_vars import get_global_args, get_timers, set_global_variables
 from chitu.muxi_utils import has_tbsgemm, tbsgemm
-from chitu.ops import apply_rotary_pos_emb
+from chitu.ops import apply_rotary_pos_emb, rms_norm
 from chitu.tensor_parallel import get_tp_group, get_tp_rank
 from chitu.tokenizer import ChatFormat, ChatFormatHF, Tokenizer, TokenizerHF
 from chitu.utils import VarLens, compute_layer_dist_in_pipe, is_layer
@@ -35,11 +35,12 @@ class RMSNorm(nn.Module):
         eps (float): Epsilon value for numerical stability. Defaults to 1e-6.
     """
 
-    def __init__(self, dim: int, eps: float = 1e-6):
+    def __init__(self, dim: int, eps: float = 1e-6, impl: str = "torch"):
         super().__init__()
         self.dim = dim
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(dim))
+        self.impl = impl
 
     def _naive_norm(self, x, compute_dtype):
         dtype = x.dtype
@@ -69,13 +70,18 @@ class RMSNorm(nn.Module):
         else:
             if compute_dtype is None:
                 compute_dtype = torch.float32
-            if hasattr(F, "rms_norm"):
-                dtype = x.dtype
-                return F.rms_norm(
-                    x.to(compute_dtype), (self.dim,), self.weight, self.eps
-                ).to(dtype)
-            else:  # Old PyTorch versions
-                return self._naive_norm(x, compute_dtype=compute_dtype)
+            if self.impl == "triton":
+                return rms_norm(x.to(compute_dtype), self.weight, self.dim, self.eps)
+            elif self.impl == "torch":
+                if hasattr(F, "rms_norm"):
+                    dtype = x.dtype
+                    return F.rms_norm(
+                        x.to(compute_dtype), (self.dim,), self.weight, self.eps
+                    ).to(dtype)
+                else:
+                    return self._naive_norm(x, compute_dtype)
+            else:
+                raise ValueError(f"Invalid implementation: {self.impl}")
 
 
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0, device=None):
@@ -278,6 +284,8 @@ class Transformer(nn.Module):
             self._init_post_layers()
 
         self.precompute_freqs_cis(max_position_embeddings, self.device)
+
+        self.do_decode_callable = None
 
     def _get_tensor_column_parallel_layer_names(self) -> List[str]:
         raise NotImplementedError
@@ -532,19 +540,23 @@ class Transformer(nn.Module):
                     'CUDA graph is currently not supported for infer.cache_type="skew"'
                 )
 
-        @make_dispatched_graphed_callables(
-            sample_args=(tokens,),
-            sample_kwargs={},
-            args_max_nelem=(tokens.numel() // batch_size * max_batch_size,),
-            kwargs_max_nelem={},
-            output_max_nelem_callback=lambda n: n // batch_size * max_batch_size,
-            enable=use_cuda_graph,
-        )
-        def do_decode(tokens):
-            freqs_cis_cos, freqs_cis_sin = self.prepare_freqs_cis_decode()
-            if self.pipeline_exec:
-                return self.decode_pipeline(tokens, freqs_cis_cos, freqs_cis_sin)
-            else:
-                return self.decode_single_device(tokens, freqs_cis_cos, freqs_cis_sin)
+        if self.do_decode_callable is None:
 
-        return do_decode(batch_size, tokens)
+            @make_dispatched_graphed_callables(
+                args_max_nelem=(tokens.numel() // batch_size * max_batch_size,),
+                kwargs_max_nelem={},
+                output_max_nelem_callback=lambda bs, n: n // bs * max_batch_size,
+                enable=use_cuda_graph,
+            )
+            def do_decode(tokens):
+                freqs_cis_cos, freqs_cis_sin = self.prepare_freqs_cis_decode()
+                if self.pipeline_exec:
+                    return self.decode_pipeline(tokens, freqs_cis_cos, freqs_cis_sin)
+                else:
+                    return self.decode_single_device(
+                        tokens, freqs_cis_cos, freqs_cis_sin
+                    )
+
+            self.do_decode_callable = do_decode
+
+        return self.do_decode_callable(batch_size, tokens)

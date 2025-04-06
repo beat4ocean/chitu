@@ -1,10 +1,16 @@
-FROM pytorch/pytorch:2.5.0-cuda12.4-cudnn9-devel AS base
+FROM mxc500-torch2.1-py310:mc2.29.0.7-ubuntu22.04-amd64 AS base
 
-ARG torch_cuda_arch_list='7.0 7.5 8.0 8.6 8.9 9.0+PTX'
-ARG optional_deps='flash_attn,flash_mla,flashinfer'
+ARG optional_deps=''
 ARG build_jobs=''
 ARG enable_editable_install='false'
 ARG enable_cython='true'
+
+# The base image uses Conda as the Python environment. We need to activate it
+# For `docker build` stage, the most straightforward way is to use `bash --login -c` as the shell
+SHELL ["/bin/bash", "--login", "-c"]
+# For `docker run` stage, we need an entrypoint
+RUN echo "source /etc/profile; \"\$@\"" > /entrypoint.sh
+ENTRYPOINT ["/bin/bash", "/entrypoint.sh"]
 
 RUN if [ "${enable_editable_install}" != "true" ] && [ "${enable_editable_install}" != "false" ]; then \
     echo "ARG enable_editable_install must either be 'true' or 'false'"; \
@@ -19,12 +25,6 @@ RUN if [ "{enable_cython}" == "true" ] && [ "${enable_editable_install}" == "tru
     exit 1; \
 fi
 
-ENV TORCH_CUDA_ARCH_LIST=${torch_cuda_arch_list}
-
-RUN apt update -y \
-    && apt install -y git \
-    && apt install -y gcc-10 g++-10
-
 WORKDIR /workspace/chitu
 COPY . .
 
@@ -32,5 +32,6 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     pip install -U pip -i https://pypi.tuna.tsinghua.edu.cn/simple
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -r requirements-build.txt
-RUN --mount=type=cache,target=/root/.cache/pip \
-    bash script/install.sh "${optional_deps}" "${build_jobs}" "${enable_editable_install}" "${enable_cython}"
+
+# The actual installing procedure requries a GPU device, which is not available in the `docker build` stage.
+# We delay it to an additional `docker run` stage which runs `script/install.sh`.

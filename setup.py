@@ -5,9 +5,13 @@ import sys
 from setuptools import Extension, setup, find_packages
 from setuptools.command.build_ext import build_ext
 from setuptools.command.build_py import build_py
+import packaging.version
 from Cython.Build import cythonize
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
+assert packaging.version.parse(setuptools.__version__) >= packaging.version.parse(
+    "62.3.0"
+), "setuptools>=62.3.0 is required for `**` wildcard in package_data."
 
 setup_dir = os.path.dirname(os.path.abspath(__file__))
 
@@ -31,9 +35,11 @@ ext_modules = [
 
 
 cython_unsafe_files = [
-    "triton_kernels.py",
-    "fused_moe.py",
-    "triton_decode_attention.py",
+    "triton_kernels.py",  # Triton kernels inside
+    "fused_moe.py",  # Triton kernels inside
+    "triton_decode_attention.py",  # Triton kernels inside
+    "__main__.py",  # Triton kernels inside
+    "serve.py",  # Reason unkown. Test not passed for Cython. (FIXME)
 ]
 
 
@@ -75,7 +81,7 @@ class SkipBuildPy(build_py):
 
 
 my_build_py = build_py
-if os.environ.get("CINFER_WITH_CYTHON", "0") != "0":
+if os.environ.get("CHITU_WITH_CYTHON", "0") != "0":
     ext_modules += cythonize(create_cython_extensions("chitu"))
     my_build_py = SkipBuildPy
 
@@ -86,7 +92,7 @@ setup(
     version="0.1.1",
     install_requires=[
         # Don't put `torch` here because it requires downloading from a specific source
-        "transformers",
+        "transformers<4.47",  # Required by auto_gptq
         "fire",
         "tiktoken>=0.7.0",  # Required by glm4
         "blobfile",

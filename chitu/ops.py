@@ -2,6 +2,8 @@ import struct
 from typing import Tuple
 
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 import triton
 import triton.language as tl
 
@@ -184,7 +186,7 @@ def apply_rotary_pos_emb_triton(q, k, cos, sin, rotary_type="hf-llama", block_si
         k_shape = k.shape
 
         if q.dim() == 4:
-            q = q.view(-1, q.shape[-2], q, shape[-1])
+            q = q.view(-1, q.shape[-2], q.shape[-1])
         elif q.dim() == 3:
             pass
         elif q.dim() == 2:
@@ -541,3 +543,79 @@ def soft_fp8_gemm_deepseek_v3(
         compute_dtype=compute_dtype,
     )
     return c
+
+
+def silu_and_mul_torch(x: torch.Tensor):
+    d = x.shape[-1] // 2
+    return F.silu(x[..., :d]) * x[..., d:]
+
+
+@auto_retry_triton_compilation
+def invoke_silu_and_mul(x):
+    n_rows = x.nelement() // x.shape[-1]
+    n_cols = x.shape[-1]
+    BLOCK_SIZE = triton.next_power_of_2(n_cols)
+    output_shape = x.shape[:-1] + (n_cols // 2,)
+    output = torch.empty(output_shape, device=x.device, dtype=x.dtype)
+    num_warps = 4
+    if BLOCK_SIZE >= 2048:
+        num_warps = 8
+    if BLOCK_SIZE >= 4096:
+        num_warps = 16
+    silu_and_mul_kernel[(n_rows,)](
+        output,
+        x,
+        output.shape[-1],
+        x.shape[-1],
+        num_warps=num_warps,
+        BLOCK_SIZE=BLOCK_SIZE,
+    )
+    return output
+
+
+def silu_and_mul(x, impl="triton"):
+    if impl == "triton":
+        return invoke_silu_and_mul(x)
+    else:
+        return silu_and_mul_torch(x)
+
+
+def calculate_settings(n):
+    # reference: https://github.com/unslothai/unsloth/blob/fd753fed99ed5f10ef8a9b7139588d9de9ddecfb/unsloth/kernels/utils.py#L43
+
+    MAX_FUSED_SIZE = 65536
+    BLOCK_SIZE = triton.next_power_of_2(n)
+    if BLOCK_SIZE > MAX_FUSED_SIZE:
+        raise RuntimeError(
+            f"Cannot launch Triton kernel since n = {n} exceeds "
+            f"the recommended Triton blocksize = {MAX_FUSED_SIZE}."
+        )
+
+    num_warps = 4
+    if BLOCK_SIZE >= 32768:
+        num_warps = 32
+    elif BLOCK_SIZE >= 8192:
+        num_warps = 16
+    elif BLOCK_SIZE >= 2048:
+        num_warps = 8
+    return BLOCK_SIZE, num_warps
+
+
+def rms_norm(X: torch.Tensor, W: torch.Tensor, dim, eps):
+    num_x = X.numel()
+    num_rows = num_x // dim
+    assert W.is_contiguous()
+    BLOCK_SIZE, num_warps = calculate_settings(dim)
+    Y = torch.empty_like(X, dtype=X.dtype, device=X.device)
+    rms_norm_kernel[num_rows,](
+        Y,
+        Y.stride(-2),
+        X,
+        X.stride(-2),
+        W,
+        dim,
+        eps,
+        BLOCK_SIZE=BLOCK_SIZE,
+        num_warps=num_warps,
+    )
+    return Y
