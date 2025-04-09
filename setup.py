@@ -24,6 +24,7 @@ ext_modules = [
             "./csrc/binding.cpp",
             "./csrc/moe_align_kernel.cu",
             "./csrc/fused_shared_experts_kernel.cu",
+            "./csrc/group_topk.cu",
         ],
         extra_compile_args={
             "cxx": ["-std=c++17"],
@@ -138,6 +139,10 @@ setup(
         "flash_mla": [
             "flash_mla @ file://localhost"
             + os.path.join(setup_dir, "third_party/FlashMLA"),
+        ],
+        "deep_gemm": [
+            "deep_gemm @ file://localhost"
+            + os.path.join(setup_dir, "third_party/DeepGEMM"),
         ],
     },
     packages=find_packages(),
