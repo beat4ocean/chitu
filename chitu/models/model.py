@@ -22,6 +22,8 @@ from chitu.tokenizer import ChatFormat, ChatFormatHF, Tokenizer, TokenizerHF
 from chitu.utils import VarLens, compute_layer_dist_in_pipe, is_layer
 from chitu.cuda_graph import make_dispatched_graphed_callables
 from chitu.device_type import is_muxi, get_device_name
+from chitu.utils import try_import_opt_dep
+import chitu_backend
 
 logger = getLogger(__name__)
 
@@ -35,25 +37,31 @@ class RMSNorm(nn.Module):
         eps (float): Epsilon value for numerical stability. Defaults to 1e-6.
     """
 
-    def __init__(self, dim: int, eps: float = 1e-6, impl: str = "torch"):
+    def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
         self.dim = dim
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(dim))
-        self.impl = impl
 
-    def _naive_norm(self, x, compute_dtype):
+    def _ref_norm(self, x, compute_dtype):
         dtype = x.dtype
         x = x.to(compute_dtype)
         y = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
         return y.to(dtype) * self.weight
 
-    def forward(self, x: torch.Tensor, compute_dtype=None):
+    def forward(
+        self,
+        x: torch.Tensor,
+        out: Optional[torch.Tensor] = None,
+        compute_dtype=None,
+        impl: str = "auto",
+    ):
         """
         Forward pass for RMSNorm.
 
         Args:
             x (torch.Tensor): Input tensor.
+            out (torch.Tensor, optional): If set, the output will be written to this tensor.
             compute_dtype (torch.dtype, optional): The dtype to use for computation. Defaults to the
                 dtype of the input tensor.
 
@@ -64,24 +72,56 @@ class RMSNorm(nn.Module):
         # pass float16 tensors to it, our CI shows it does not work for some models, especially GPTQ
         # quantized models. Maybe we should make the dtype optional.
 
-        if has_tbsgemm and x.dtype == torch.float16:
-            output = tbsgemm.norm(x, self.weight)
-            return output
-        else:
-            if compute_dtype is None:
-                compute_dtype = torch.float32
-            if self.impl == "triton":
-                return rms_norm(x.to(compute_dtype), self.weight, self.dim, self.eps)
-            elif self.impl == "torch":
-                if hasattr(F, "rms_norm"):
-                    dtype = x.dtype
-                    return F.rms_norm(
-                        x.to(compute_dtype), (self.dim,), self.weight, self.eps
-                    ).to(dtype)
-                else:
-                    return self._naive_norm(x, compute_dtype)
+        if compute_dtype is None:
+            compute_dtype = torch.float32
+
+        if impl == "auto":
+            triton, has_triton = try_import_opt_dep("triton", "triton")
+            if out is not None:
+                impl = "cuda"
+            elif (
+                has_tbsgemm
+                and get_global_args().dtype == "float16"
+                and self.eps == 1e-6
+            ):
+                impl = "muxi_w8a8_kernels"
+            elif has_triton:
+                impl = "triton"
+            elif hasattr(F, "rms_norm"):
+                impl = "torch"
             else:
-                raise ValueError(f"Invalid implementation: {self.impl}")
+                impl = "ref"
+
+        if impl == "triton":
+            assert out is None
+            return rms_norm(x, self.weight, self.eps, compute_dtype=compute_dtype)
+        elif impl == "cuda":
+            # Currently, this kernel always raise to float32 to compute
+            return chitu_backend.cuda_rms_norm(x, self.weight, eps=self.eps, out=out)
+        elif impl == "muxi_w8a8_kernels":
+            assert out is None
+            assert self.eps == 1e-6
+            assert x.dtype == torch.float16
+            return tbsgemm.norm(x, self.weight)
+        elif impl == "torch":
+            dtype = x.dtype
+            tmp_out = F.rms_norm(
+                x.to(compute_dtype), (self.dim,), self.weight, self.eps
+            ).to(dtype)
+            if out is not None:
+                out.copy_(tmp_out)
+            else:
+                out = tmp_out
+            return out
+        elif impl == "ref":
+            tmp_out = self._ref_norm(x, compute_dtype)
+            if out is not None:
+                out.copy_(tmp_out)
+            else:
+                out = tmp_out
+            return out
+        else:
+            raise ValueError(f"Invalid RMSNorm implementation: {impl}")
 
 
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0, device=None):
@@ -237,12 +277,14 @@ class Transformer(nn.Module):
         model_parallel_size: int,
         attn_backend: AttnBackend,
         op_impl: str,
+        is_fp4=False,
         **kvargs,
     ):
         super().__init__()
         self.cache = cache
         self.attn_backend = attn_backend
         self.op_impl = op_impl
+        self.is_fp4 = is_fp4
         self.rank = torch.distributed.get_rank()
         self.local_rank = int(os.environ.get("LOCAL_RANK", 0))
         self.world_size = torch.distributed.get_world_size()
@@ -263,7 +305,6 @@ class Transformer(nn.Module):
         self.params = params
         self.vocab_size = params.vocab_size
         self.global_n_layers = params.n_layers
-
         if self.pipeline_exec:
             num_layers_of_each_rank = compute_layer_dist_in_pipe(
                 self.global_n_layers, self.pipeline_parallel_size
@@ -349,28 +390,54 @@ class Transformer(nn.Module):
         cpl_names = self._get_tensor_column_parallel_layer_names()
         rpl_names = self._get_tensor_row_parallel_layer_names()
 
+        quant = self.params.quant if hasattr(self.params, "quant") else None
+
         for name, param in checkpoint.items():
             if any(is_layer(s, name) for s in cpl_names):
-                if name.endswith("weight") or (
-                    self.params.type == "deepseek-v3" and name.endswith("scale")
+                if name.endswith("input_scale") or (name.endswith("scale_2")):
+                    partial_checkpoint[name] = param
+                elif (
+                    name.endswith(".weight")
+                    or (self.params.type == "deepseek-v3" and name.endswith(".scale"))
+                    or (quant == "blockfp8" and name.endswith(".scale"))
+                    or (quant == "blockfp4" and name.endswith(".weight_scale"))
                 ):
                     chunks = torch.chunk(param, world_size, dim=0)
                     partial_checkpoint[name] = chunks[rank]
-                elif name.endswith("bias"):
+                elif name.endswith(".bias"):
                     chunks = torch.chunk(param, world_size, dim=-1)
+                    partial_checkpoint[name] = chunks[rank]
+                elif quant == "autoawq" and (
+                    name.endswith(".qweight")
+                    or name.endswith(".qzeros")
+                    or name.endswith(".scales")
+                ):
+                    chunks = torch.chunk(param, world_size, dim=1)
                     partial_checkpoint[name] = chunks[rank]
                 else:
                     assert False, f"Illegal parallel tensor {name}"
             elif any(is_layer(s, name) for s in rpl_names):
-                if name.endswith("weight") or (
-                    self.params.type == "deepseek-v3" and name.endswith("scale")
+                if name.endswith("input_scale") or (name.endswith("scale_2")):
+                    partial_checkpoint[name] = param
+                elif (
+                    name.endswith(".weight")
+                    or (self.params.type == "deepseek-v3" and name.endswith("scale"))
+                    or (quant == "blockfp8" and name.endswith(".scale"))
+                    or (quant == "blockfp4" and name.endswith(".weight_scale"))
                 ):
                     chunks = torch.chunk(param, world_size, dim=1)
                     partial_checkpoint[name] = chunks[rank]
-                elif name.endswith("bias"):
+                elif name.endswith(".bias"):
                     # Rank 0 needs a full bias and only rank 0 needs it
                     if get_tp_rank() == 0:
                         partial_checkpoint[name] = param
+                elif quant == "autoawq" and (
+                    name.endswith(".qweight")
+                    or name.endswith(".qzeros")
+                    or name.endswith(".scales")
+                ):
+                    chunks = torch.chunk(param, world_size, dim=0)
+                    partial_checkpoint[name] = chunks[rank]
                 else:
                     assert False, f"Illegal parallel tensor {name}"
             else:
@@ -533,12 +600,6 @@ class Transformer(nn.Module):
         max_batch_size = get_global_args().infer.max_reqs
 
         use_cuda_graph = get_global_args().infer.use_cuda_graph
-
-        if use_cuda_graph:
-            if get_global_args().infer.cache_type == "skew":
-                raise NotImplementedError(
-                    'CUDA graph is currently not supported for infer.cache_type="skew"'
-                )
 
         if self.do_decode_callable is None:
 

@@ -1,17 +1,24 @@
 import os
-import subprocess
-import sys
 
+import setuptools
 from setuptools import Extension, setup, find_packages
-from setuptools.command.build_ext import build_ext
 from setuptools.command.build_py import build_py
 import packaging.version
 from Cython.Build import cythonize
+
+try:
+    import torch
+except ImportError:
+    raise RuntimeError(
+        "torch is required to build chitu. Please install torch (with the correct CUDA version) before installing chitu.\n"
+        "For example: pip install torch --index-url https://download.pytorch.org/whl/cu124"
+    )
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
 assert packaging.version.parse(setuptools.__version__) >= packaging.version.parse(
     "62.3.0"
 ), "setuptools>=62.3.0 is required for `**` wildcard in package_data."
+
 
 setup_dir = os.path.dirname(os.path.abspath(__file__))
 
@@ -25,15 +32,17 @@ ext_modules = [
             "./csrc/moe_align_kernel.cu",
             "./csrc/fused_shared_experts_kernel.cu",
             "./csrc/group_topk.cu",
+            "./csrc/rotary_pos_emb_llama.cu",
+            "./csrc/rms_norm.cu",
+            "./csrc/weight_layout_change.cu",
         ],
         extra_compile_args={
             "cxx": ["-std=c++17"],
             "nvcc": ["-std=c++17"],
         },
         include_dirs=[os.path.join(setup_dir, "third_party/spdlog/include")],
-    )
+    ),
 ]
-
 
 cython_unsafe_files = [
     "triton_kernels.py",  # Triton kernels inside
@@ -90,7 +99,7 @@ if os.environ.get("CHITU_WITH_CYTHON", "0") != "0":
 # logic and declaration, and simpler if you include description/version in a file.
 setup(
     name="chitu",
-    version="0.1.1",
+    version="0.2.2",
     install_requires=[
         # Don't put `torch` here because it requires downloading from a specific source
         "transformers<4.47",  # Required by auto_gptq
@@ -110,15 +119,13 @@ setup(
         "quant": [
             "optimum",
             "bitsandbytes",
-            "EETQ @ file://localhost" + os.path.join(setup_dir, "third_party/EETQ"),
-            "awq_inference_engine @ file://localhost"
-            + os.path.join(setup_dir, "third_party/llm-awq/awq/kernels"),
-            "auto_gptq @ file://localhost"
-            + os.path.join(setup_dir, "third_party/AutoGPTQ"),
+            "auto_gptq",
             "w8a8gemm @ file://localhost"
             + os.path.join(setup_dir, "third_party/nv_w8a8_kernels/w8a8gemm"),
             "w8a8gemv @ file://localhost"
             + os.path.join(setup_dir, "third_party/nv_w8a8_kernels/w8a8gemv"),
+            "autoawq-kernels==0.0.8",
+            "autoawq[kernels]",
         ],
         "muxi_layout_kernels": [
             "muxi_layout_kernels @ file://localhost"
@@ -143,6 +150,9 @@ setup(
         "deep_gemm": [
             "deep_gemm @ file://localhost"
             + os.path.join(setup_dir, "third_party/DeepGEMM"),
+        ],
+        "cpu": [
+            "cpuinfer @ file://localhost" + os.path.join(setup_dir, "csrc/cpuinfer"),
         ],
     },
     packages=find_packages(),

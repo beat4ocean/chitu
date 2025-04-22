@@ -1,5 +1,6 @@
 from logging import getLogger
 from typing import Any, List, Mapping, Optional
+import math
 
 import torch
 import torch.nn.functional as F
@@ -8,10 +9,11 @@ from torch import nn
 from chitu.attn_backend import AttnBackend
 from chitu.models.model import Attention, RMSNorm, Transformer, TransformerBlock
 from chitu.muxi_utils import (
-    linear_layout_contig_x_contig_y,
-    linear_layout_contig_x_native_y,
-    linear_layout_native_x_contig_y,
+    LinearLayoutContigXContigY,
+    LinearLayoutContigXNativeY,
+    LinearLayoutNativeXContigY,
     preprocess_weights_for_native_layout,
+    get_muxi_padded_input,
 )
 from chitu.ops import apply_rotary_pos_emb
 from chitu.tensor_parallel import (
@@ -20,8 +22,26 @@ from chitu.tensor_parallel import (
     VocabParallelEmbedding,
     get_tp_size,
 )
+from chitu.global_vars import get_global_args
 
 logger = getLogger(__name__)
+
+
+def get_rms_norm_impl():
+    impl = "auto"
+
+    # These models are extremely sensitive to the implementation of RMSNorm. We always use "ref" as
+    # a stable implementation. Feel free to remove this if you have find some other ways to make the
+    # model stable.
+    args = get_global_args()
+    if args.models.name == "Mixtral-8x7B-Instruct-v0.1":
+        impl = "ref"
+    if hasattr(args.models, "quant") and args.models.quant == "simple_w8a8":
+        impl = "ref"
+    if hasattr(args.models, "quant") and args.models.quant == "simple_w8a8_muxi":
+        impl = "ref"
+
+    return impl
 
 
 class AttentionHFLlama(Attention):
@@ -63,7 +83,7 @@ class AttentionHFLlama(Attention):
                 (args.n_heads + 2 * self.n_kv_heads) * self.head_dim,
                 has_bias=qkv_has_bias,
                 gather_output=False,
-                linear_op=qkv_proj_linear,
+                base_linear_class=qkv_proj_linear,
             )
         else:
             self.q_proj = ColumnParallelLinear(
@@ -71,28 +91,28 @@ class AttentionHFLlama(Attention):
                 args.n_heads * self.head_dim,
                 has_bias=qkv_has_bias,
                 gather_output=False,
-                linear_op=qkv_proj_linear,
+                base_linear_class=qkv_proj_linear,
             )
             self.k_proj = ColumnParallelLinear(
                 args.dim,
                 self.n_kv_heads * self.head_dim,
                 has_bias=qkv_has_bias,
                 gather_output=False,
-                linear_op=qkv_proj_linear,
+                base_linear_class=qkv_proj_linear,
             )
             self.v_proj = ColumnParallelLinear(
                 args.dim,
                 self.n_kv_heads * self.head_dim,
                 has_bias=qkv_has_bias,
                 gather_output=False,
-                linear_op=qkv_proj_linear,
+                base_linear_class=qkv_proj_linear,
             )
         self.o_proj = RowParallelLinear(
             args.n_heads * self.head_dim,
             args.dim,
             has_bias=o_has_bias,
             input_is_parallel=True,
-            linear_op=o_proj_linear,
+            base_linear_class=o_proj_linear,
         )
 
     def _run_linear(self, x):
@@ -100,10 +120,7 @@ class AttentionHFLlama(Attention):
             x_shape = x.shape
             x = x.reshape(-1, x.shape[-1])
             n = x.shape[0]
-            if n > 1:
-                x_paded = torch.zeros(((n + 15) & ~15, x.shape[1]), device=x.device)
-                x_paded[: x.shape[0], :] = x
-                x = x_paded
+            x = get_muxi_padded_input(x)
         if self.merge_qkv:
             qkv = self.qkv_proj(x)
             if self.op_impl == "muxi_custom_kernel":
@@ -135,10 +152,7 @@ class AttentionHFLlama(Attention):
             x_shape = x.shape
             x = x.reshape(-1, x.shape[-1])
             n = x.shape[0]
-            if n > 1:
-                x_paded = torch.zeros(((n + 15) & ~15, x.shape[1]), device=x.device)
-                x_paded[: x.shape[0], :] = x
-                x = x_paded
+            x = get_muxi_padded_input(x)
         y = self.o_proj(x)
         if self.op_impl == "muxi_custom_kernel":
             y = y[:n, :]
@@ -271,7 +285,7 @@ class FeedForwardHFLlama(nn.Module):
                 hidden_dim * 2,
                 has_bias=False,
                 gather_output=False,
-                linear_op=gate_up_proj_linear,
+                base_linear_class=gate_up_proj_linear,
             )
         else:
             self.gate_proj = ColumnParallelLinear(
@@ -279,21 +293,21 @@ class FeedForwardHFLlama(nn.Module):
                 hidden_dim,
                 has_bias=False,
                 gather_output=False,
-                linear_op=gate_up_proj_linear,
+                base_linear_class=gate_up_proj_linear,
             )
             self.up_proj = ColumnParallelLinear(
                 dim,
                 hidden_dim,
                 has_bias=False,
                 gather_output=False,
-                linear_op=gate_up_proj_linear,
+                base_linear_class=gate_up_proj_linear,
             )
         self.down_proj = RowParallelLinear(
             hidden_dim,
             dim,
             has_bias=False,
             input_is_parallel=True,
-            linear_op=down_proj_linear,
+            base_linear_class=down_proj_linear,
         )
 
     def forward(self, x):
@@ -301,10 +315,7 @@ class FeedForwardHFLlama(nn.Module):
             x_shape = x.shape
             x = x.reshape(-1, x_shape[-1])
             n = x.shape[0]
-            if n > 1:
-                x_paded = torch.zeros(((n + 15) & ~15, x.shape[1]), device=x.device)
-                x_paded[: x.shape[0], :] = x
-                x = x_paded
+            x = get_muxi_padded_input(x)
         if self.merge_gate_up:
             gate_up_out = self.gate_up_proj(x)
             if self.op_impl == "muxi_custom_kernel":
@@ -363,10 +374,13 @@ class TransformerBlockHFLlama(TransformerBlock):
         varlens=None,
     ):
         h = self.self_attn(
-            self.input_layernorm(x), freqs_cis_cos, freqs_cis_sin, varlens
+            self.input_layernorm(x, impl=get_rms_norm_impl()),
+            freqs_cis_cos,
+            freqs_cis_sin,
+            varlens,
         )
         h += x
-        out = h + self.mlp(self.post_attention_layernorm(h))
+        out = h + self.mlp(self.post_attention_layernorm(h, impl=get_rms_norm_impl()))
         return out
 
 
@@ -655,7 +669,10 @@ class TransformerHFLlama(Transformer):
     def _init_post_layers(self):
         self.norm = RMSNorm(self.params.dim, eps=self.params.norm_eps)
         self.lm_head = ColumnParallelLinear(
-            self.params.dim, self.params.vocab_size, has_bias=False
+            self.params.dim,
+            self.params.vocab_size,
+            has_bias=False,
+            disable_quantization=True,
         )
 
     def _pre_layers(self, h):
@@ -663,7 +680,7 @@ class TransformerHFLlama(Transformer):
 
     def _post_layers(self, h):
         """NOTE: _post_layers is assumed to be a token-wise computation"""
-        h = self.norm(h)
+        h = self.norm(h, impl=get_rms_norm_impl())
         h = self.lm_head(h)
         return h
 
@@ -673,6 +690,11 @@ class TransformerHFLlama(Transformer):
             head_dim // 2 if self.rotary_type == "glm4" else head_dim,
             max_position_embeddings=max_position_embeddings,
             base=float(self.params.rope_theta),
+            rope_scaling=(
+                self.params.rope_scaling
+                if hasattr(self.params, "rope_scaling")
+                else None
+            ),
             device=device,
         )
 
@@ -691,7 +713,12 @@ class TransformerHFLlama(Transformer):
 
 class RotaryEmbeddingHFLlama(nn.Module):
     def __init__(
-        self, dim: int, max_position_embeddings: int, base: float, device=None
+        self,
+        dim: int,
+        max_position_embeddings: int,
+        base: float,
+        rope_scaling=None,
+        device=None,
     ):
         super().__init__()
 
@@ -705,6 +732,46 @@ class RotaryEmbeddingHFLlama(nn.Module):
                 / self.dim
             )
         )
+
+        if rope_scaling is not None:
+            if rope_scaling.rope_type == "llama3":
+                # Based on https://github.com/huggingface/transformers/blob/3165eb7c2808832d0de86c8f508d9da6b2124044/src/transformers/modeling_rope_utils.py#L385
+                # licensed under Apache-2.0
+
+                factor = rope_scaling.factor  # `8` in the original implementation
+                low_freq_factor = (
+                    rope_scaling.low_freq_factor
+                )  # `1` in the original implementation
+                high_freq_factor = (
+                    rope_scaling.high_freq_factor
+                )  # `4` in the original implementation
+                old_context_len = (
+                    rope_scaling.original_max_position_embeddings
+                )  # `8192` in the original implementation
+
+                low_freq_wavelen = old_context_len / low_freq_factor
+                high_freq_wavelen = old_context_len / high_freq_factor
+
+                wavelen = 2 * math.pi / inv_freq
+                # wavelen < high_freq_wavelen: do nothing
+                # wavelen > low_freq_wavelen: divide by factor
+                inv_freq_llama = torch.where(
+                    wavelen > low_freq_wavelen, inv_freq / factor, inv_freq
+                )
+                # otherwise: interpolate between the two, using a smooth factor
+                smooth_factor = (old_context_len / wavelen - low_freq_factor) / (
+                    high_freq_factor - low_freq_factor
+                )
+                smoothed_inv_freq = (
+                    1 - smooth_factor
+                ) * inv_freq_llama / factor + smooth_factor * inv_freq_llama
+                is_medium_freq = ~(wavelen < high_freq_wavelen) * ~(
+                    wavelen > low_freq_wavelen
+                )
+                inv_freq = torch.where(
+                    is_medium_freq, smoothed_inv_freq, inv_freq_llama
+                )
+
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
         t = torch.arange(
@@ -719,33 +786,21 @@ class RotaryEmbeddingHFLlama(nn.Module):
 
 
 def get_linear_layout_contig_x_native_y(op_impl: str):
-    if op_impl == "torch":
-        return torch.nn.functional.linear
-    elif op_impl == "muxi_custom_kernel":
-        return linear_layout_contig_x_native_y
-    elif op_impl == "muxi_w8a8_kernel":
-        return torch.nn.functional.linear
+    if op_impl == "muxi_custom_kernel":
+        return LinearLayoutContigXNativeY
     else:
-        raise NotImplementedError()
+        return None  # Let QuantizationRegistry pick it
 
 
 def get_linear_layout_native_x_contig_y(op_impl: str):
-    if op_impl == "torch":
-        return torch.nn.functional.linear
-    elif op_impl == "muxi_custom_kernel":
-        return linear_layout_native_x_contig_y
-    elif op_impl == "muxi_w8a8_kernel":
-        return torch.nn.functional.linear
+    if op_impl == "muxi_custom_kernel":
+        return LinearLayoutNativeXContigY
     else:
-        raise NotImplementedError()
+        return None  # Let QuantizationRegistry pick it
 
 
 def get_linear_layout_contig_x_contig_y(op_impl: str):
-    if op_impl == "torch":
-        return torch.nn.functional.linear
-    elif op_impl == "muxi_custom_kernel":
-        return linear_layout_contig_x_contig_y
-    elif op_impl == "muxi_w8a8_kernel":
-        return torch.nn.functional.linear
+    if op_impl == "muxi_custom_kernel":
+        return LinearLayoutContigXContigY
     else:
-        raise NotImplementedError()
+        return None  # Let QuantizationRegistry pick it

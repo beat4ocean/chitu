@@ -1,5 +1,5 @@
 import struct
-from typing import Tuple
+from typing import Tuple, Optional
 
 import torch
 import torch.nn as nn
@@ -10,6 +10,19 @@ import triton.language as tl
 from chitu.triton_kernels import *
 from chitu.device_type import is_hopper
 from chitu.utils import try_import_opt_dep
+from chitu.global_vars import get_global_args
+import chitu_backend
+
+
+def to_triton_dtype(dtype: torch.dtype):
+    if dtype == torch.float16:
+        return tl.float16
+    elif dtype == torch.bfloat16:
+        return tl.bfloat16
+    elif dtype == torch.float32:
+        return tl.float32
+    else:
+        raise NotImplementedError(f"Unsupported dtype: {dtype}")
 
 
 def auto_retry_triton_compilation(fn):
@@ -55,19 +68,20 @@ def auto_retry_triton_compilation(fn):
 
 @auto_retry_triton_compilation
 def append_to_paged_kv_cache(
-    kv_cache,  # (num_pages, page_size, other dims...)
+    kv_cache,  # (num_pages, page_size, other contiguous dims...)
     page_table,  # (batch_size, num_pages_per_sample)
-    this_kv,  # (batch_size, other dims...)
+    this_kv,  # (batch_size, other contiguous dims...)
     old_seq_lens,  # (batch_size,)
 ):
     """
     for i in range(cache_seqlens.shape[0]):
-        kv_cache[block_table[i][cache_seqlens[i] // 64]][cache_seqlens[i] % 64] = kv[i]
+        kv_cache[block_table[i, cache_seqlens[i] // page_size], cache_seqlens[i] % page_size] = kv[i]
     """
 
-    assert kv_cache.is_contiguous()
+    kv_cache = kv_cache.view(kv_cache.shape[0], kv_cache.shape[1], -1)
+    this_kv = this_kv.view(this_kv.shape[0], -1)
+
     assert page_table.is_contiguous()
-    assert this_kv.is_contiguous()
     assert old_seq_lens.is_contiguous()
 
     page_size = kv_cache.shape[1]
@@ -93,6 +107,50 @@ def append_to_paged_kv_cache(
         BATCH_SIZE=batch_size,
         NUM_PAGES_PER_SAMPLE=num_pages_per_sample,
         TOT_LEN_OF_OTHER_DIMS=tot_len_of_other_dims,
+        KV_CACHE_STRIDE0=kv_cache.stride(0),
+        KV_CACHE_STRIDE1=kv_cache.stride(1),
+        THIS_KV_STRIDE0=this_kv.stride(0),
+        BLOCK_SIZE=block_size,
+    )
+
+
+@auto_retry_triton_compilation
+def append_to_non_paged_kv_cache(
+    kv_cache,  # (batch_size, seq_len, other contiguous dims...)
+    this_kv,  # (batch_size, other contiguous dims...)
+    old_seq_lens,  # (batch_size,)
+):
+    """
+    for i in range(cache_seqlens.shape[0]):
+        kv_cache[i, cache_seqlens[i]] = kv[i]
+    """
+
+    kv_cache = kv_cache.view(kv_cache.shape[0], kv_cache.shape[1], -1)
+    this_kv = this_kv.view(this_kv.shape[0], -1)
+
+    assert old_seq_lens.is_contiguous()
+
+    batch_size = kv_cache.shape[0]
+    assert this_kv.shape[0] == batch_size
+    assert old_seq_lens.shape[0] == batch_size
+
+    tot_len_of_other_dims = this_kv.numel() // batch_size
+    assert (
+        kv_cache.numel() // (kv_cache.shape[0] * kv_cache.shape[1])
+        == tot_len_of_other_dims
+    )
+
+    block_size = 512  # GPU block size
+    grid = (batch_size, triton.cdiv(tot_len_of_other_dims, block_size))
+    append_to_non_paged_kv_cache_kernel[grid](
+        kv_cache_ptr=kv_cache,
+        this_kv_ptr=this_kv,
+        old_seq_lens_ptr=old_seq_lens,
+        BATCH_SIZE=batch_size,
+        TOT_LEN_OF_OTHER_DIMS=tot_len_of_other_dims,
+        KV_CACHE_STRIDE0=kv_cache.stride(0),
+        KV_CACHE_STRIDE1=kv_cache.stride(1),
+        THIS_KV_STRIDE0=this_kv.stride(0),
         BLOCK_SIZE=block_size,
     )
 
@@ -127,17 +185,24 @@ def reshape_rotary_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
 
 
 @auto_retry_triton_compilation
-def apply_rotary_pos_emb_triton(q, k, cos, sin, rotary_type="hf-llama", block_size=128):
+def apply_rotary_pos_emb_triton(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    rotary_type: str = "hf-llama",
+    block_size=128,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    # Prepare output tensor
+    q_out = torch.empty_like(q)
+    k_out = torch.empty_like(k)
+
     if rotary_type == "hf-llama":
         # "hf-llama" has an [real, real, ..., real, imag, imag, ..., imag] layout.
 
         # Get tensor shapes
         q_batch_size, q_n_local_heads, q_head_dim = q.shape
         k_batch_size, k_n_local_heads, k_head_dim = k.shape
-
-        # Prepare output tensor
-        q_output = torch.empty_like(q)
-        k_output = torch.empty_like(k)
 
         # Define grid size
         q_grid = (q_batch_size * q_n_local_heads, q_head_dim // block_size)
@@ -148,38 +213,38 @@ def apply_rotary_pos_emb_triton(q, k, cos, sin, rotary_type="hf-llama", block_si
         assert k.is_contiguous()
         assert cos.is_contiguous()
         assert sin.is_contiguous()
-        assert q_output.is_contiguous()
-        assert k_output.is_contiguous()
+        assert q_out.is_contiguous()
+        assert k_out.is_contiguous()
         rotary_embedding_kernel_hf_llama[q_grid](
             q,
             cos,
             sin,
-            q_output,
+            q_out,
             q_n_local_heads,
             q.stride(0),
             q.stride(1),
             cos.stride(0),
             sin.stride(0),
-            q_output.stride(0),
-            q_output.stride(1),
+            q_out.stride(0),
+            q_out.stride(1),
             BLOCK_SIZE=block_size,
         )
         rotary_embedding_kernel_hf_llama[k_grid](
             k,
             cos,
             sin,
-            k_output,
+            k_out,
             k_n_local_heads,
             k.stride(0),
             k.stride(1),
             cos.stride(0),
             sin.stride(0),
-            k_output.stride(0),
-            k_output.stride(1),
+            k_out.stride(0),
+            k_out.stride(1),
             BLOCK_SIZE=block_size,
         )
 
-        return q_output, k_output
+        return q_out, k_out
 
     elif rotary_type == "llama":
         # "llama" has an [real, imag, real, imag, ..., real, imag] layout.
@@ -188,21 +253,26 @@ def apply_rotary_pos_emb_triton(q, k, cos, sin, rotary_type="hf-llama", block_si
         k_shape = k.shape
 
         if q.dim() == 4:
-            q = q.view(-1, q.shape[-2], q.shape[-1])
+            q = q.view(-1, q_shape[-2], q_shape[-1])
+            q_out = q_out.view(-1, q_shape[-2], q_shape[-1])
         elif q.dim() == 3:
             pass
         elif q.dim() == 2:
-            q = q.view(-1, 1, q.shape[-1])
+            q = q.view(-1, 1, q_shape[-1])
+            q_out = q_out.view(-1, 1, q_shape[-1])
         else:
             assert False
         if k.dim() == 4:
-            k = k.view(-1, k.shape[-2], k.shape[-1])
+            k = k.view(-1, k_shape[-2], k_shape[-1])
+            k_out = k_out.view(-1, k_shape[-2], k_shape[-1])
         elif k.dim() == 3:
             pass
         elif k.dim() == 2:
-            k = k.view(-1, 1, k.shape[-1])
+            k = k.view(-1, 1, k_shape[-1])
+            k_out = k_out.view(-1, 1, k_shape[-1])
         else:
             assert False
+
         assert q.shape[-1] == k.shape[-1]
         assert q.shape[0] == k.shape[0]
         assert q.shape[-1] // 2 == cos.shape[-1]
@@ -210,9 +280,8 @@ def apply_rotary_pos_emb_triton(q, k, cos, sin, rotary_type="hf-llama", block_si
         bs, head_num_q, rotary_dim = q.shape
         bs, head_num_k, rotary_dim = k.shape
 
-        # Prepare output tensor
-        out_q = torch.empty_like(q)
-        out_k = torch.empty_like(k)
+        assert cos.is_contiguous()
+        assert sin.is_contiguous()
 
         # Launch kernel
         BLOCK_H = min(
@@ -222,31 +291,92 @@ def apply_rotary_pos_emb_triton(q, k, cos, sin, rotary_type="hf-llama", block_si
         rotary_embedding_kernel_llama[grid](
             q,
             k,
-            out_q,
-            out_k,
+            q_out,
+            k_out,
             cos,
             sin,
             q.stride(0),
             q.stride(1),
             k.stride(0),
             k.stride(1),
-            out_q.stride(0),
-            out_q.stride(1),
-            out_k.stride(0),
-            out_k.stride(1),
+            q_out.stride(0),
+            q_out.stride(1),
+            k_out.stride(0),
+            k_out.stride(1),
             head_num_q,
             head_num_k,
             rotary_dim,
             BLOCK_H,
         )
 
-        return out_q.view(q_shape), out_k.view(k_shape)
+        return q_out.view(q_shape), k_out.view(k_shape)
 
     else:
-        raise ValueError(f"Unknown rotary type: {rotary_type}")
+        raise NotImplementedError(
+            f"Unsupported rotary type: {rotary_type} for Triton implementation"
+        )
 
 
-def apply_rotary_pos_emb_torch(q, k, cos, sin, rotary_type="hf-llama"):
+def apply_rotary_pos_emb_cuda(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    q_out: Optional[torch.Tensor] = None,
+    k_out: Optional[torch.Tensor] = None,
+    rotary_type: str = "hf-llama",
+    impl: str = "auto",
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    if rotary_type == "llama":
+        q_shape = q.shape
+        k_shape = k.shape
+
+        if q.dim() == 4:
+            q = q.view(-1, q_shape[-2], q_shape[-1])
+            if q_out is not None:
+                q_out = q_out.view(-1, q_shape[-2], q_shape[-1])
+        elif q.dim() == 3:
+            pass
+        elif q.dim() == 2:
+            q = q.view(-1, 1, q_shape[-1])
+            if q_out is not None:
+                q_out = q_out.view(-1, 1, q_shape[-1])
+        else:
+            assert False
+        if k.dim() == 4:
+            k = k.view(-1, k_shape[-2], k_shape[-1])
+            if k_out is not None:
+                k_out = k_out.view(-1, k_shape[-2], k_shape[-1])
+        elif k.dim() == 3:
+            pass
+        elif k.dim() == 2:
+            k = k.view(-1, 1, k_shape[-1])
+            if k_out is not None:
+                k_out = k_out.view(-1, 1, k_shape[-1])
+        else:
+            assert False
+
+        q_out, k_out = chitu_backend.cuda_rotary_pos_emb_llama(
+            q, k, cos, sin, q_out=q_out, k_out=k_out
+        )
+
+        return q_out.view(q_shape), k_out.view(k_shape)
+
+    else:
+        raise NotImplementedError(
+            f"Unsupported rotary type: {rotary_type} for CUDA implementation"
+        )
+
+
+def apply_rotary_pos_emb_torch(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    q_out: Optional[torch.Tensor] = None,
+    k_out: Optional[torch.Tensor] = None,
+    rotary_type: str = "hf-llama",
+) -> Tuple[torch.Tensor, torch.Tensor]:
     if rotary_type == "hf-llama":
         # "hf-llama" has an [real, real, ..., real, imag, imag, ..., imag] layout.
         cos = torch.cat([cos, cos], dim=-1)
@@ -257,7 +387,7 @@ def apply_rotary_pos_emb_torch(q, k, cos, sin, rotary_type="hf-llama"):
         sin_k = reshape_rotary_for_broadcast(sin, k)
         q_embed = (q * cos_q) + (rotate_half(q) * sin_q)
         k_embed = (k * cos_k) + (rotate_half(k) * sin_k)
-        return q_embed.to(q.dtype), k_embed.to(k.dtype)
+        q_embed, k_embed = q_embed.to(q.dtype), k_embed.to(k.dtype)
 
     elif rotary_type == "llama":
         # "llama" has an [real, imag, real, imag, ..., real, imag] layout.
@@ -269,7 +399,7 @@ def apply_rotary_pos_emb_torch(q, k, cos, sin, rotary_type="hf-llama"):
         sin_k = reshape_rotary_for_broadcast(sin, k)
         q_embed = (q * cos_q) + (rotate_pairwise(q) * sin_q)
         k_embed = (k * cos_k) + (rotate_pairwise(k) * sin_k)
-        return q_embed.to(q.dtype), k_embed.to(k.dtype)
+        q_embed, k_embed = q_embed.to(q.dtype), k_embed.to(k.dtype)
 
     elif rotary_type == "glm4":
         # TODO: Now we transpose q and k, do the rotary, and transpose back.
@@ -306,30 +436,79 @@ def apply_rotary_pos_emb_torch(q, k, cos, sin, rotary_type="hf-llama"):
             .permute(0, 1, 3, 2)
             .reshape(k_embed.shape[0], k_embed.shape[1], k_embed.shape[2])
         )
-        return torch.cat([q_embed, q_pass], dim=-1), torch.cat(
+        q_embed, k_embed = torch.cat([q_embed, q_pass], dim=-1), torch.cat(
             [k_embed, k_pass], dim=-1
         )
 
     else:
         raise ValueError(f"Unknown rotary type: {rotary_type}")
 
+    if q_out is not None:
+        q_out.copy_(q_embed)
+    else:
+        q_out = q_embed
+    if k_out is not None:
+        k_out.copy_(k_embed)
+    else:
+        k_out = k_embed
+    return q_out, k_out
 
-def apply_rotary_pos_emb(q, k, cos, sin, rotary_type="hf-llama"):
-    if rotary_type == "hf-llama" or (
-        rotary_type == "llama" and hasattr(triton.language, "interleave")
-    ):
+
+def apply_rotary_pos_emb(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    q_out: Optional[torch.Tensor] = None,
+    k_out: Optional[torch.Tensor] = None,
+    rotary_type: str = "hf-llama",
+    impl: str = "auto",
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Rotary positional embedding
+
+    Args:
+        q: Query input
+        k: Key input
+        cos: Precomputed cosine
+        sin: Precomputed sine
+        q_out: If set, the query output will be written to this tensor
+        k_out: If set, the key output will be written to this tensor
+        rotary_type: Variant of rotary positional embedding
+    """
+
+    if impl == "auto":
+        if (
+            q_out is None
+            and k_out is None
+            and (
+                rotary_type == "hf-llama"
+                or (rotary_type == "llama" and hasattr(triton.language, "interleave"))
+            )
+        ):
+            impl = "triton"
+        elif rotary_type == "llama":
+            impl = "cuda"
+        else:
+            impl = "torch"
+
+    if impl == "triton":
         # NOTE: some platform such as muxi now doesn't support triton.language.interleave, so we need check attr
         # NOTE: Performance of triton rotary kernel is untested for large batch sizes.
         # If it's slow on prefill, just switch to torch implementation on the else case.
+        assert q_out is None  # Triton does not support in-place operation
+        assert k_out is None
         return apply_rotary_pos_emb_triton(q, k, cos, sin, rotary_type=rotary_type)
-    else:
-        return apply_rotary_pos_emb_torch(
-            q,
-            k,
-            cos,
-            sin,
-            rotary_type=rotary_type,
+    elif impl == "cuda":
+        return apply_rotary_pos_emb_cuda(
+            q, k, cos, sin, q_out=q_out, k_out=k_out, rotary_type=rotary_type
         )
+    elif impl == "torch":
+        return apply_rotary_pos_emb_torch(
+            q, k, cos, sin, q_out=q_out, k_out=k_out, rotary_type=rotary_type
+        )
+    else:
+        raise NotImplementedError(f"Unsupported rotary implementation: {impl}")
 
 
 @auto_retry_triton_compilation
@@ -429,7 +608,15 @@ def weight_dequant_soft_fp8_deepseek_v3(
         assert False, "Weight tensor must have 2 or 3 dimensions"
 
     x = x.view(dtype=torch.uint8)
-    bit_reordered_x = torch.empty_like(x, dtype=torch.uint32)
+    if hasattr(torch, "uint32"):
+        bit_reordered_x = torch.empty_like(x, dtype=torch.uint32)
+    elif hasattr(torch, "int32"):
+        bit_reordered_x = torch.empty_like(x, dtype=torch.int32)
+    else:
+        raise ValueError(
+            "The current PyTorch environment supports neither the uint32 type nor the int32 type."
+        )
+
     grid = lambda meta: (triton.cdiv(B * M * N, meta["BLOCK_SIZE"]),)
     weight_dequant_soft_fp8_deepseek_v3_kernel_step_1[grid](
         x, bit_reordered_x, B * M * N, BLOCK_SIZE=block_size
@@ -458,9 +645,39 @@ def weight_dequant_soft_fp8_deepseek_v3(
     return y
 
 
+def weight_quant_deepseek_v3(
+    w: torch.Tensor, block_size: int = 128
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    row, col = w.shape
+    assert row % block_size == 0
+    assert col % block_size == 0
+    w_block_at_last = (
+        w.view(row // block_size, block_size, col // block_size, block_size)
+        .permute(0, 2, 1, 3)
+        .contiguous()
+        .view(-1, block_size * block_size)
+    ).to(torch.float32)
+    s = torch.amax(torch.abs(w_block_at_last), dim=-1, keepdim=True)
+    w_block_at_last = (w_block_at_last / s).to(torch.float8_e4m3fn)
+    w = (
+        w_block_at_last.view(
+            row // block_size, col // block_size, block_size, block_size
+        )
+        .permute(0, 2, 1, 3)
+        .contiguous()
+        .view(row, col)
+    )
+    s = s.view(row // block_size, col // block_size)
+    return w, s
+
+
 @auto_retry_triton_compilation
 def fp8_gemm_deepseek_v3(
-    a: torch.Tensor, a_s: torch.Tensor, b: torch.Tensor, b_s: torch.Tensor
+    a: torch.Tensor,
+    a_s: torch.Tensor,
+    b: torch.Tensor,
+    b_s: torch.Tensor,
+    b_s_2: Optional[torch.Tensor] = None,
 ):
     """
     Perform a matrix multiplication using FP8 precision.
@@ -489,12 +706,16 @@ def fp8_gemm_deepseek_v3(
     has_deep_gemm = False
     if torch.get_default_dtype() == torch.bfloat16 and is_hopper() is True:
         deep_gemm, has_deep_gemm = try_import_opt_dep("deep_gemm", "deep_gemm")
-    if has_deep_gemm:
+    if has_deep_gemm and b.dtype is not torch.uint8:
         deep_gemm.gemm_fp8_fp8_bf16_nt((a, a_s), (b, b_s), c)
     else:
-        fp8_gemm_deepseek_v3_kernel[grid](
-            a, b, c, a_s, b_s, M, N, K, group_n=128, group_k=128
-        )
+        if b.dtype is torch.uint8:
+            assert b_s_2 is not None, "Fp4 quant gemm must hava scale2"
+            assert b_s_2.is_contiguous(), "Fp4 scale2 must be contiguous"
+        else:
+            fp8_gemm_deepseek_v3_kernel[grid](
+                a, b, c, a_s, b_s, M, N, K, group_n=128, group_k=128
+            )
     return c
 
 
@@ -503,6 +724,7 @@ def soft_fp8_gemm_deepseek_v3(
     a: torch.Tensor,
     b: torch.Tensor,
     b_s: torch.Tensor,
+    b_s_2: Optional[torch.Tensor] = None,
 ):
     """
     Perform a matrix multiplication with FP8 dynamically casted to BF16.
@@ -537,18 +759,123 @@ def soft_fp8_gemm_deepseek_v3(
     grid = lambda META: (
         triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
     )
-    soft_fp8_gemm_deepseek_v3_kernel[grid](
+    if b.dtype == torch.uint8:
+        assert b_s_2 is not None, "Scaling_2 factor tensor must exist"
+        assert b_s_2.is_contiguous(), "Scaling_2 factor tensor must be contiguous"
+
+    else:
+        soft_fp8_gemm_deepseek_v3_kernel[grid](
+            a,
+            b.view(dtype=torch.uint8),
+            c,
+            b_s,
+            M,
+            N,
+            K,
+            group_n=128,
+            group_k=128,
+            fp8_to_fp32_scale=fp8_to_fp32_scale,
+            compute_dtype=compute_dtype,
+        )
+    return c
+
+
+@auto_retry_triton_compilation
+def soft_fp4_raise_to_fp8_gemm_deepseek_v3(
+    a: torch.Tensor,
+    a_s: torch.Tensor,
+    b: torch.Tensor,
+    b_s: torch.Tensor,
+    b_s_2: Optional[torch.Tensor] = None,
+):
+    """
+    Perform a matrix multiplication with FP8 dynamically casted to BF16.
+
+    Args:
+        a (torch.Tensor): The first input matrix, must be contiguous.
+        a_s (torch.Tensor): The scaling factor of first input matrix, must be contiguous.
+        b (torch.Tensor): The second input matrix, must be contiguous.
+        b_s (torch.Tensor): The scaling factor for the second input matrix, must be contiguous.
+        b_s_2 (torch.Tensor): The scaling factor for b_s, must be contiguous.
+
+    Returns:
+        torch.Tensor: The result of the matrix multiplication.
+    """
+    assert a.is_contiguous() and b.is_contiguous(), "Input tensors must be contiguous"
+    assert a_s.is_contiguous(), "Scaling factor of A must be contiguous"
+    assert b_s.is_contiguous(), "Scaling factor tensor must be contiguous"
+    K = a.size(-1)
+    M = a.numel() // K
+    N = b.size(0)
+    c = a.new_empty(*a.size()[:-1], N, dtype=torch.get_default_dtype())
+
+    grid = lambda META: (
+        triton.cdiv(M, META["BLOCK_SIZE_M"]),
+        triton.cdiv(N, META["BLOCK_SIZE_N"]),
+    )
+    assert b_s_2 is not None, "Scaling_2 factor tensor must exist"
+    assert b_s_2.is_contiguous(), "Scaling_2 factor tensor must be contiguous"
+
+    soft_fp4_raise_to_fp8_gemm_deepseek_v3_kernel[grid](
+        a,
+        b,
+        c,
+        a_s,
+        b_s,
+        b_s_2,
+        M,
+        N,
+        K,
+        group_k=128,
+        stride_b_s=16,
+        is_w1w3=(b_s_2.numel() == 2),
+    )
+    return c
+
+
+@auto_retry_triton_compilation
+def soft_fp4_raise_to_bf16_gemm_deepseek_v3(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    b_s: torch.Tensor,
+    b_s_2: Optional[torch.Tensor] = None,
+):
+    """
+    Perform a matrix multiplication with FP8 dynamically casted to BF16.
+
+    Args:
+        a (torch.Tensor): The first input matrix, must be contiguous.
+        b (torch.Tensor): The second input matrix, must be contiguous.
+        b_s (torch.Tensor): The scaling factor for the second input matrix, must be contiguous.
+        b_s_2 (torch.Tensor): The scaling factor for b_s, must be contiguous.
+
+    Returns:
+        torch.Tensor: The result of the matrix multiplication.
+    """
+    assert a.is_contiguous() and b.is_contiguous(), "Input tensors must be contiguous"
+    assert b_s.is_contiguous(), "Scaling factor tensor must be contiguous"
+    K = a.size(-1)
+    M = a.numel() // K
+    N = b.size(0)
+    c = a.new_empty(*a.size()[:-1], N, dtype=torch.get_default_dtype())
+
+    grid = lambda META: (
+        triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
+    )
+    assert b_s_2 is not None, "Scaling_2 factor tensor must exist"
+    assert b_s_2.is_contiguous(), "Scaling_2 factor tensor must be contiguous"
+
+    soft_fp4_raise_to_bf16_gemm_deepseek_v3_kernel[grid](
         a,
         b.view(dtype=torch.uint8),
         c,
         b_s,
+        b_s_2,
         M,
         N,
         K,
-        group_n=128,
-        group_k=128,
-        fp8_to_fp32_scale=fp8_to_fp32_scale,
-        compute_dtype=compute_dtype,
+        stride_b_s=16,
+        is_w1w3=(b_s_2.numel() == 2),
     )
     return c
 
@@ -565,17 +892,11 @@ def invoke_silu_and_mul(x):
     BLOCK_SIZE, _ = calculate_settings(n_cols // 2)
     output_shape = x.shape[:-1] + (n_cols // 2,)
     output = torch.empty(output_shape, device=x.device, dtype=x.dtype)
-    num_warps = 4
-    if BLOCK_SIZE >= 2048:
-        num_warps = 8
-    if BLOCK_SIZE >= 4096:
-        num_warps = 16
     silu_and_mul_kernel[(n_rows,)](
         output,
         x,
         output.shape[-1],
         x.shape[-1],
-        num_warps=num_warps,
         BLOCK_SIZE=BLOCK_SIZE,
     )
     return output
@@ -609,21 +930,117 @@ def calculate_settings(n):
     return BLOCK_SIZE, num_warps
 
 
-def rms_norm(X: torch.Tensor, W: torch.Tensor, dim, eps):
-    num_x = X.numel()
-    num_rows = num_x // dim
+def rms_norm(X: torch.Tensor, W: torch.Tensor, eps, compute_dtype):
+    out = torch.empty_like(X)
+
+    X_shape = X.shape
+    num_cols = X.shape[-1]
+    num_rows = X.numel() // num_cols
+
+    # Assume the row dimensions are contiguous, but it can be non-contiguous between
+    # each row
+    X = X.view(num_rows, num_cols)
+    out = out.view(num_rows, num_cols)
+
     assert W.is_contiguous()
-    BLOCK_SIZE, num_warps = calculate_settings(dim)
-    Y = torch.empty_like(X, dtype=X.dtype, device=X.device)
+
+    BLOCK_SIZE, num_warps = calculate_settings(num_cols)
     rms_norm_kernel[num_rows,](
-        Y,
-        Y.stride(-2),
+        out,
+        out.stride(-2),
         X,
         X.stride(-2),
         W,
-        dim,
+        num_cols,
         eps,
+        compute_dtype=to_triton_dtype(compute_dtype),
         BLOCK_SIZE=BLOCK_SIZE,
-        num_warps=num_warps,
     )
-    return Y
+    return out.view(X_shape)
+
+
+@auto_retry_triton_compilation
+def quant_einsum_shc_hdc_shd(
+    group_A: torch.Tensor,
+    group_B: torch.Tensor,
+    group_b_s: torch.Tensor,
+    *,
+    group_n: int = 128,
+    group_k: int = 128,
+    soft_fp8: bool = False,
+    impl: str = "auto",
+):
+    assert group_A.dim() == 3
+    assert group_B.dim() == 3
+    assert group_A.shape[1] == group_B.shape[0]
+    assert group_A.shape[2] == group_B.shape[2]
+
+    if impl == "auto":
+        if group_b_s is not None:
+            impl = "triton"
+        else:
+            impl = "torch"
+
+    if impl == "torch":
+        if group_b_s is not None:
+            weight_dequant_fn = (
+                weight_dequant_soft_fp8_deepseek_v3
+                if soft_fp8
+                else weight_dequant_deepseek_v3
+            )
+            group_B = weight_dequant_fn(group_B, group_b_s, block_size=128)
+        return torch.einsum("shc,hdc->shd", group_A, group_B)
+
+    elif impl == "triton":
+        assert group_B.shape[1] == group_b_s.shape[1] * group_k
+        assert group_B.shape[2] == group_b_s.shape[2] * group_n
+        s, h, c, d = (
+            group_A.shape[0],
+            group_A.shape[1],
+            group_A.shape[2],
+            group_B.shape[1],
+        )
+        group_size = h
+        M = s
+        K = c
+        N = d
+        stride_A_group, stride_A_m = group_A.stride()[1], group_A.stride()[0]
+        stride_B_group, stride_B_1 = group_B.stride()[0], group_B.stride()[1]
+        stride_C_group, stride_C_m = d, h * d
+        assert group_b_s.is_contiguous()
+        group_C = torch.empty((s, h, d), dtype=group_A.dtype, device=group_A.device)
+
+        if soft_fp8:
+            fp8_to_fp32_scale = struct.unpack(">f", bytes.fromhex("7b800000"))[0]
+        else:
+            fp8_to_fp32_scale = None
+
+        grid = lambda META: (
+            group_size,
+            triton.cdiv(M, META["BLOCK_SIZE_M"]),
+            triton.cdiv(N, META["BLOCK_SIZE_N"]),
+        )
+
+        grouped_matmul_kernel[grid](
+            group_A,
+            group_B,
+            group_b_s,
+            group_C,
+            M,
+            K,
+            N,
+            stride_A_group,
+            stride_A_m,
+            stride_B_group,
+            stride_B_1,
+            stride_C_group,
+            stride_C_m,
+            group_n,
+            group_k,
+            fp8_to_fp32_scale=fp8_to_fp32_scale,
+        )
+
+        return group_C
+
+    else:
+        raise RuntimeError(f"Unsupported impl: {impl}")
